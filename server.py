@@ -55,6 +55,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "agy-sidecar"}
+
 # Concurrency lock: maximum 1 agy execution at a time with nice -n 19 to guarantee ZERO PC lag
 SEMAPHORE = asyncio.Semaphore(1)
 
@@ -105,7 +109,10 @@ async def run_agy_cli(prompt: str, model: str = "gemini-3.8-flash-low", effort: 
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            try:
+                proc.kill()
+            except (ProcessLookupError, Exception):
+                pass
             raise HTTPException(status_code=504, detail="Official Antigravity CLI timed out after 90 seconds")
 
         if proc.returncode != 0:
