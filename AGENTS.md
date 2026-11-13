@@ -10,7 +10,7 @@ Local OpenAI-compatible API daemon backed by the official compiled Google Antigr
 
 ## Endpoints
 * `GET /health` — Service health and binary metadata.
-* `GET /v1/models` — OpenAI model catalog (returns Gemini 3.8 Flash, Argon, Sonnet aliases, GPT-4o drop-ins).
+* `GET /v1/models` — OpenAI model catalog (dynamically auto-fetched via `agy models` + GPT-4o drop-in aliases).
 * `POST /v1/chat/completions` — Standard OpenAI Chat Completions (used by AI Agent nodes, Cursor, IDEs).
 * `POST /v1/responses` — OpenAI Responses API (required by n8n OpenAI Node v2.3+).
 
