@@ -6,6 +6,7 @@ Exposes standard OpenAI endpoints on 0.0.0.0:8000 (accessible via localhost & ho
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger("agy-sidecar")
@@ -27,7 +29,7 @@ DEFAULT_MODEL_ENV = os.environ.get("AGY_DEFAULT_MODEL")
 MODELS_CACHE_TTL = int(os.environ.get("AGY_MODELS_CACHE_TTL", "30"))
 MODELS_RETRY_TTL = 10
 MODELS_FETCH_TIMEOUT = int(os.environ.get("AGY_MODELS_TIMEOUT", "45"))
-CLI_TIMEOUT = int(os.environ.get("AGY_TIMEOUT", "90"))
+CLI_TIMEOUT = int(os.environ.get("AGY_TIMEOUT", "300"))
 
 # Legacy OpenAI drop-in aliases mapped dynamically to the active default model
 LEGACY_ALIAS_CATALOG: List[Dict[str, str]] = [
@@ -369,12 +371,13 @@ def verify_api_key(authorization: Optional[str] = Header(None)):
     return True
 
 
-async def run_agy_cli(
+def _build_cli_args(
     prompt: str,
-    model: Optional[str] = None,
-    effort: Optional[str] = None,
-    timeout: int = CLI_TIMEOUT,
-) -> str:
+    model: Optional[str],
+    effort: Optional[str],
+    output_format: str = "text",
+) -> List[str]:
+    """Builds the agy CLI argument list shared by the streaming and non-streaming paths."""
     target_model = resolve_model_id(model)
     args: List[str] = []
     if target_model:
@@ -384,6 +387,91 @@ async def run_agy_cli(
     elif effort:
         args.extend(["--effort", effort])
     args.extend(["--disable-slash-commands", "--print", prompt])
+    if output_format != "text":
+        args.extend(["--output-format", output_format])
+    return args
+
+
+async def _iter_agy_stream(
+    prompt: str,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    timeout: int = CLI_TIMEOUT,
+):
+    """Runs `agy --output-format stream-json` and yields {"text"}, {"usage"} or {"error"} events."""
+    binary = _resolve_agy_binary()
+    cmd = ["nice", "-n", "19", binary, *_build_cli_args(prompt, model, effort, "stream-json")]
+    deadline = time.monotonic() + timeout
+
+    async with SEMAPHORE:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            yield {"error": f"Antigravity CLI binary not found at: {binary}"}
+            return
+        except OSError as exc:
+            yield {"error": f"Failed to start Antigravity CLI: {exc}"}
+            return
+
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield {"error": f"Antigravity CLI timed out after {timeout} seconds"}
+                    break
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    yield {"error": f"Antigravity CLI timed out after {timeout} seconds"}
+                    break
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event = payload.get("event")
+                if event == "step_update":
+                    update = payload.get("step_update") or {}
+                    delta = update.get("text_delta")
+                    if delta and update.get("step_type") == "agent_response":
+                        yield {"text": delta}
+                elif event == "result":
+                    result = payload.get("result") or {}
+                    status = result.get("status")
+                    if status not in (None, "SUCCESS"):
+                        yield {"error": f"Antigravity returned status {status}"}
+                    yield {"usage": result.get("usage") or {}}
+                    break
+        finally:
+            # Kill on early exit (result received) and reap; detached MCP helpers can hold the pipe open.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, Exception):
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+
+async def run_agy_cli(
+    prompt: str,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    timeout: int = CLI_TIMEOUT,
+) -> str:
+    args = _build_cli_args(prompt, model, effort)
 
     try:
         rc, stdout, stderr = await _exec_agy_cli(args, timeout=timeout)
@@ -489,6 +577,49 @@ async def retrieve_model(model_id: str, _: bool = Depends(verify_api_key)):
     )
 
 
+async def _sse_chat_stream(prompt: str, model: Optional[str], effort: Optional[str], selected_model: str):
+    """Adapts agy stream-json events into OpenAI chat.completion.chunk SSE frames."""
+    chunk_id = f"chatcmpl-agy-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    prompt_tokens = len(prompt) // 4
+
+    def frame(delta: Dict[str, Any], finish_reason: Optional[str] = None, usage: Optional[Dict[str, int]] = None) -> str:
+        payload: Dict[str, Any] = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": selected_model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            payload["usage"] = usage
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield frame({"role": "assistant", "content": ""})
+
+    usage: Optional[Dict[str, int]] = None
+    output_chars = 0
+    async for event in _iter_agy_stream(prompt, model, effort):
+        if "text" in event:
+            output_chars += len(event["text"])
+            yield frame({"content": event["text"]})
+        elif "usage" in event:
+            raw_usage = event["usage"] or {}
+            usage = {
+                "prompt_tokens": raw_usage.get("input_tokens", prompt_tokens),
+                "completion_tokens": raw_usage.get("output_tokens", output_chars // 4),
+                "total_tokens": raw_usage.get("total_tokens", 0),
+            }
+        elif "error" in event:
+            logger.warning("agy stream error: %s", event["error"])
+            yield frame({"content": f"\n[agy error] {event['error']}"})
+
+    if usage is None:
+        usage = {"prompt_tokens": prompt_tokens, "completion_tokens": output_chars // 4, "total_tokens": 0}
+    yield frame({}, finish_reason="stop", usage=usage)
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, _: bool = Depends(verify_api_key)):
@@ -496,6 +627,14 @@ async def chat_completions(req: ChatCompletionRequest, _: bool = Depends(verify_
     conversation = [_format_role_message(msg.role, msg.content) for msg in req.messages]
     full_prompt = "\n\n".join(conversation)
     selected_model = req.model or get_default_model() or "default"
+
+    if req.stream:
+        return StreamingResponse(
+            _sse_chat_stream(full_prompt, req.model, req.reasoning_effort, selected_model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
+
     raw_output = await run_agy_cli(full_prompt, model=req.model, effort=req.reasoning_effort)
 
     return {
