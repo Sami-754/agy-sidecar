@@ -31,6 +31,19 @@ MODELS_RETRY_TTL = 10
 MODELS_FETCH_TIMEOUT = int(os.environ.get("AGY_MODELS_TIMEOUT", "45"))
 CLI_TIMEOUT = int(os.environ.get("AGY_TIMEOUT", "300"))
 
+# --- Pi catalog auto-sync -------------------------------------------------
+# At boot and on every model-cache refresh the live `agy models` catalog is projected into
+# pi's models.json so reasoning variants (levels live in the model id) stay discoverable
+# without hand-editing config on every CLI update or fresh install.
+PI_MODELS_JSON = os.environ.get("PI_MODELS_JSON", os.path.expanduser("~/.pi/agent/models.json"))
+PI_PROVIDER_KEY = os.environ.get("PI_PROVIDER_KEY", "agy")
+PI_PROVIDER_NAME = os.environ.get("PI_PROVIDER_NAME", "Antigravity agy sidecar (localhost:8000)")
+PI_MODELS_SYNC = os.environ.get("PI_MODELS_SYNC", "1").lower() not in ("0", "false", "no", "off")
+# Comma-separated deny list kept across regenerations so cost-banned families never come back.
+PI_MODELS_DENY = os.environ.get("PI_MODELS_DENY", "kimi,moonshot,qwen")
+PI_MODELS_MAX_TOKENS = int(os.environ.get("PI_MODELS_MAX_TOKENS", "8192"))
+PI_MODELS_CONTEXT = int(os.environ.get("PI_MODELS_CONTEXT", "200000"))
+
 # Legacy OpenAI drop-in aliases mapped dynamically to the active default model
 LEGACY_ALIAS_CATALOG: List[Dict[str, str]] = [
     {"id": "gpt-4o", "description": "OpenAI drop-in alias mapped to active default Antigravity model"},
@@ -157,6 +170,91 @@ def _with_legacy_aliases(models: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return combined
 
 
+def _pi_context_window(model_id: str) -> int:
+    return 131072 if "gpt-oss" in model_id else PI_MODELS_CONTEXT
+
+
+def _pi_model_entries(models: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Projects an agy catalog into pi models.json entries, honouring the cost deny list."""
+    deny = [p.strip().lower() for p in PI_MODELS_DENY.split(",") if p.strip()]
+    entries: List[Dict[str, Any]] = []
+    for model in models:
+        model_id = str(model.get("id") or "").strip()
+        if not model_id or model_id in LEGACY_ALIAS_NAMES:
+            continue
+        if any(pattern in model_id.lower() for pattern in deny):
+            continue
+        entries.append(
+            {
+                "id": model_id,
+                "name": str(model.get("description") or model_id).strip(),
+                "contextWindow": _pi_context_window(model_id),
+                "maxTokens": PI_MODELS_MAX_TOKENS,
+                "input": ["text"],
+            }
+        )
+    return entries
+
+
+def _default_pi_provider() -> Dict[str, Any]:
+    return {
+        "name": PI_PROVIDER_NAME,
+        "baseUrl": os.environ.get("PI_BASE_URL", "http://localhost:8000/v1"),
+        "api": "openai-completions",
+        "apiKey": os.environ.get("PI_API_KEY", API_KEY_EXPECTED),
+        "compat": {"supportsUsageInStreaming": False},
+    }
+
+
+async def sync_pi_models(models: List[Dict[str, str]]) -> bool:
+    """Writes the live catalog into pi's models.json provider block. Returns True when the file changed."""
+    if not PI_MODELS_SYNC:
+        return False
+
+    entries = _pi_model_entries(models)
+    if not entries:
+        return False
+
+    try:
+        data: Dict[str, Any] = {}
+        if os.path.exists(PI_MODELS_JSON):
+            with open(PI_MODELS_JSON, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        elif not os.path.isdir(os.path.dirname(PI_MODELS_JSON) or "."):
+            logger.info("pi config dir missing (%s); skipping catalog sync", PI_MODELS_JSON)
+            return False
+
+        providers = data.setdefault("providers", {})
+        provider = providers.setdefault(PI_PROVIDER_KEY, _default_pi_provider())
+        if provider.get("models") == entries:
+            return False
+
+        previous = [m.get("id") for m in (provider.get("models") or []) if isinstance(m, dict)]
+        provider["models"] = entries
+
+        target = PI_MODELS_JSON
+        try:
+            shutil.copyfile(target, target + ".bak")
+        except OSError:
+            pass
+        tmp_path = f"{target}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, target)
+
+        added = sorted(set(m["id"] for m in entries) - set(previous))
+        removed = sorted(set(previous) - set(m["id"] for m in entries))
+        logger.info(
+            "Synced %d %s models into %s (added=%s removed=%s)",
+            len(entries), PI_PROVIDER_KEY, target, added or "none", removed or "none",
+        )
+        return True
+    except Exception as exc:
+        logger.warning("pi catalog sync failed: %s", exc)
+        return False
+
+
 async def _fetch_models_from_cli() -> List[Dict[str, str]]:
     """Fetches live models via `agy models`."""
     try:
@@ -213,6 +311,7 @@ async def get_available_models(force_refresh: bool = False) -> List[Dict[str, st
             _models_cache_sig = sig
             _models_cache_expires_at = time.monotonic() + max(MODELS_CACHE_TTL, 0)
             _models_source = "agy-cli"
+            await sync_pi_models(fetched)
             return _models_cache
 
         if _models_cache:
@@ -299,6 +398,7 @@ async def _warmup_cache() -> None:
     """Populates version and dynamic model cache shortly after server boot."""
     try:
         await get_agy_version()
+        # force_refresh=True also triggers sync_pi_models(), so a fresh install/boot self-configures pi.
         await get_available_models(force_refresh=True)
     except asyncio.CancelledError:
         raise
@@ -575,6 +675,21 @@ async def retrieve_model(model_id: str, _: bool = Depends(verify_api_key)):
         status_code=404,
         detail={"error": {"message": f"The model '{model_id}' does not exist", "type": "invalid_request_error"}},
     )
+
+
+@app.post("/v1/models/sync")
+@app.post("/models/sync")
+async def sync_models_endpoint(_: bool = Depends(verify_api_key)):
+    """Force-refreshes the catalog from the CLI and re-projects it into pi's models.json."""
+    models = await get_available_models(force_refresh=True)
+    written = await sync_pi_models(models)
+    return {
+        "status": "ok",
+        "models": len(models),
+        "pi_models_json": PI_MODELS_JSON,
+        "provider": PI_PROVIDER_KEY,
+        "written": written,
+    }
 
 
 async def _sse_chat_stream(prompt: str, model: Optional[str], effort: Optional[str], selected_model: str):

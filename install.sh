@@ -79,6 +79,10 @@ EOF
     [ -n "$AGY_BIN" ] && echo "Environment=AGY_BINARY=$AGY_BIN"
     [ -n "${AGY_API_KEY:-}" ] && echo "Environment=AGY_API_KEY=$AGY_API_KEY"
     [ -n "${AGY_MODELS_CACHE_TTL:-}" ] && echo "Environment=AGY_MODELS_CACHE_TTL=$AGY_MODELS_CACHE_TTL"
+    echo "Environment=PI_MODELS_JSON=${PI_MODELS_JSON:-$HOME/.pi/agent/models.json}"
+    echo "Environment=PI_MODELS_SYNC=${PI_MODELS_SYNC:-1}"
+    echo "Environment=PI_MODELS_DENY=${PI_MODELS_DENY:-kimi,moonshot,qwen}"
+    echo "Environment=PI_BASE_URL=http://localhost:$PORT/v1"
     [ -n "${AGY_DEFAULT_MODEL:-}" ] && echo "Environment=AGY_DEFAULT_MODEL=$AGY_DEFAULT_MODEL"
     cat <<EOF
 
@@ -99,16 +103,18 @@ if command -v curl &>/dev/null; then
         echo "    Docker Base URL: http://host.docker.internal:$PORT/v1"
         echo "    API Key:         $API_KEY"
         if [ -n "$AGY_BIN" ]; then
-            echo "==> Fetching live models from agy CLI..."
+            echo "==> Syncing live models into pi config..."
             "$PYTHON_BIN" - <<PY || true
 import json, urllib.request
 req = urllib.request.Request(
-    "http://localhost:$PORT/v1/models?refresh=true",
-    headers={"Authorization": "Bearer $API_KEY"},
+    "http://localhost:$PORT/v1/models/sync",
+    data=b"{}",
+    headers={"Authorization": "Bearer $API_KEY", "Content-Type": "application/json"},
+    method="POST",
 )
-with urllib.request.urlopen(req, timeout=45) as resp:
-    data = json.loads(resp.read().decode()).get("data", [])
-    print(f"    Loaded {len(data)} models: {', '.join(m['id'] for m in data)}")
+with urllib.request.urlopen(req, timeout=60) as resp:
+    body = json.loads(resp.read().decode())
+print(f"    {body.get('models')} models -> {body.get('pi_models_json')} (provider '{body.get('provider')}', written={body.get('written')})")
 PY
         fi
     else
